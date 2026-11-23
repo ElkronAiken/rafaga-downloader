@@ -1,0 +1,81 @@
+name: Release
+
+# Cada push a main: corre los tests, calcula la versión según los mensajes de commit
+# (Conventional Commits), actualiza pyproject.toml, crea la etiqueta vX.Y.Z,
+# publica en el Comfy Registry y crea el release en GitHub.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install aiohttp
+      - run: python -m unittest discover -s tests -v
+
+  release:
+    needs: tests
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Calcular la próxima versión
+        id: version
+        run: |
+          LAST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ]; then RANGE="$LAST_TAG..HEAD"; else RANGE="HEAD"; fi
+          git log --format='%s%n%b%n--commit--' $RANGE | python .github/scripts/next_version.py "$LAST_TAG" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Escribir la versión en pyproject.toml
+        if: steps.version.outputs.release == 'true'
+        run: python .github/scripts/next_version.py --write "${{ steps.version.outputs.version }}"
+
+      # Se publica antes de commitear y etiquetar: si falla (por ejemplo, falta el
+      # secret REGISTRY_ACCESS_TOKEN), no queda nada a medias y se puede reintentar.
+      - name: Publicar en el Comfy Registry
+        if: steps.version.outputs.release == 'true'
+        uses: Comfy-Org/publish-node-action@main
+        with:
+          personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+
+      - name: Commit de la versión y etiqueta
+        if: steps.version.outputs.release == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet; then
+            git commit -am "chore(release): v$VERSION [skip ci]"
+            git push origin HEAD:main
+          fi
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Crear release en GitHub
+        if: steps.version.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: gh release create "v$VERSION" --title "v$VERSION" --generate-notes

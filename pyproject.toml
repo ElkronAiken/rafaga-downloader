@@ -1,0 +1,19 @@
+[project]
+name = "rafaga-downloader"
+description = "Ráfaga: fast model downloads for ComfyUI. Downloads each file over several connections at once, verifies SHA-256, resumes interrupted downloads and fetches your workflow's missing models in one click."
+version = "1.0.0"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = []
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/ElkronAiken/rafaga-downloader"
+"Bug Tracker" = "https://github.com/ElkronAiken/rafaga-downloader/issues"
+
+[tool.comfy]
+PublisherId = "elkronaiken"
+DisplayName = "Ráfaga — Fast Model Downloads"
+Icon = "https://raw.githubusercontent.com/ElkronAiken/rafaga-downloader/main/assets/icon.svg"
