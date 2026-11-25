@@ -38,7 +38,7 @@ Cada push a `main` corre los tests y **puede publicar una versión en el Comfy R
 | `tipo!:` o `BREAKING CHANGE:` en el cuerpo | major (**2**.0.0) |
 | `docs:` `chore:` `ci:` `test:` `style:` `build:` | no publica |
 
-El workflow escribe la versión en `pyproject.toml`, publica con `Comfy-Org/publish-node-action@main` (secret `REGISTRY_ACCESS_TOKEN`), después commitea `chore(release): vX.Y.Z [skip ci]`, crea la etiqueta `vX.Y.Z` y el GitHub release. Si la publicación falla, no se crea la etiqueta y se puede reintentar.
+El workflow escribe la versión en `pyproject.toml`, publica con `Comfy-Org/publish-node-action@main` (secret `REGISTRY_ACCESS_TOKEN`; con `skip_checkout: 'true'`, porque el checkout propio de la action hace `git reset --hard` y borra la versión escrita), después commitea `chore(release): vX.Y.Z [skip ci]`, crea la etiqueta `vX.Y.Z` y el GitHub release. Si la publicación falla, no se crea la etiqueta y se puede reintentar.
 
 ## Reglas
 
