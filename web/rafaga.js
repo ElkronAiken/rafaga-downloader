@@ -14,7 +14,7 @@ const STRINGS = {
     missingAllThere: "Ya tenés todos los modelos de este workflow.",
     missingQueued: (n) => `${n} modelo(s) en cola`,
     urlSection: "Descargar desde una URL",
-    urlPlaceholder: "https://huggingface.co/.../resolve/main/vae/modelo.safetensors",
+    urlPlaceholder: "Link a un archivo o a un repo de Hugging Face",
     folderAuto: "Detectar carpeta desde la URL",
     filenamePlaceholder: "Nombre del archivo (opcional)",
     downloadBtn: "Descargar",
@@ -35,6 +35,21 @@ const STRINGS = {
     settingConnections: "Conexiones por archivo",
     settingConnectionsTip: "Cuántos tramos del mismo archivo se bajan en paralelo (1 a 16).",
     needUrl: "Pegá una URL que empiece con http:// o https://",
+    exploring: "Leyendo el repo…",
+    pickHint: "Un repo suele traer variantes del mismo modelo (bf16, fp8, ema…). Elegí solo lo que usa tu workflow: no hace falta bajar todo.",
+    diffusersWarn: "Este repo está en formato diffusers (para la librería diffusers). ComfyUI suele usar archivos únicos: buscá una versión del modelo para ComfyUI (por ejemplo, de Comfy-Org).",
+    noModelFiles: "No hay archivos de modelo en este repo o carpeta.",
+    noFolder: "Carpeta no detectada",
+    chooseFolder: "Elegí la carpeta…",
+    selectGroup: "Seleccionar todos los de esta carpeta",
+    installed: "Ya está",
+    selectedSummary: (n, size) => `${n} seleccionado(s) · ${size}`,
+    downloadSelected: "Bajar seleccionados",
+    needFolder: (names) => `Elegí la carpeta para: ${names}`,
+    sameName: (f) => `Dos archivos se llamarían igual (${f}) en la misma carpeta: elegí uno.`,
+    skippedNote: (n) => `Se ocultaron ${n} archivo(s) que no son modelos.`,
+    truncatedNote: "El repo es muy grande y se muestra solo una parte. Pegá el link de una carpeta (…/tree/main/carpeta) para ver el resto.",
+    close: "Cerrar",
   },
   en: {
     tooltip: "Ráfaga: fast model downloads",
@@ -44,7 +59,7 @@ const STRINGS = {
     missingAllThere: "You already have every model this workflow needs.",
     missingQueued: (n) => `${n} model(s) queued`,
     urlSection: "Download from a URL",
-    urlPlaceholder: "https://huggingface.co/.../resolve/main/vae/model.safetensors",
+    urlPlaceholder: "Link to a file or to a Hugging Face repo",
     folderAuto: "Detect folder from the URL",
     filenamePlaceholder: "File name (optional)",
     downloadBtn: "Download",
@@ -65,6 +80,21 @@ const STRINGS = {
     settingConnections: "Connections per file",
     settingConnectionsTip: "How many parts of the same file download in parallel (1 to 16).",
     needUrl: "Paste a URL that starts with http:// or https://",
+    exploring: "Reading the repo…",
+    pickHint: "A repo usually holds variants of the same model (bf16, fp8, ema…). Pick only what your workflow uses: you don't need everything.",
+    diffusersWarn: "This repo uses the diffusers format (for the diffusers library). ComfyUI usually loads single files: look for a ComfyUI version of the model (for example, from Comfy-Org).",
+    noModelFiles: "There are no model files in this repo or folder.",
+    noFolder: "Folder not detected",
+    chooseFolder: "Choose a folder…",
+    selectGroup: "Select every file in this folder",
+    installed: "Installed",
+    selectedSummary: (n, size) => `${n} selected · ${size}`,
+    downloadSelected: "Download selected",
+    needFolder: (names) => `Choose the folder for: ${names}`,
+    sameName: (f) => `Two files would get the same name (${f}) in the same folder: pick one.`,
+    skippedNote: (n) => `${n} non-model file(s) hidden.`,
+    truncatedNote: "This repo is very large, so only part of it is shown. Paste a folder link (…/tree/main/folder) to see the rest.",
+    close: "Close",
   },
 };
 
@@ -78,10 +108,11 @@ const t = () => STRINGS[locale()];
 
 // ---------------------------------------------------------------- helpers ---
 function fmtBytes(n) {
+  // Decimal units (1 GB = 10^9 bytes), the same ones Hugging Face shows.
   if (n == null) return "?";
   const u = ["B", "KB", "MB", "GB", "TB"];
   let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  while (n >= 1000 && i < u.length - 1) { n /= 1000; i++; }
   return `${n.toFixed(i >= 3 ? 2 : i ? 1 : 0)} ${u[i]}`;
 }
 function fmtEta(job) {
@@ -119,7 +150,7 @@ async function apiJson(path, options = {}) {
 }
 
 // ----------------------------------------------------------------- state ---
-const state = { jobs: new Map(), folders: [], root: null, lastStatus: new Map() };
+const state = { jobs: new Map(), folders: [], root: null, lastStatus: new Map(), explorer: null, urlInput: null };
 
 async function loadFolders() {
   try { state.folders = (await apiJson("/rafaga/folders")).folders || []; } catch (_) { state.folders = []; }
@@ -217,6 +248,154 @@ function openPanel() {
   } catch (_) { /* ignore */ }
 }
 
+// ------------------------------------------------- Hugging Face explorer ---
+// A link to a whole repo (or to a folder of it) lists its model files so you can
+// pick which ones to download instead of pasting one link per file.
+function isHfRepoUrl(value) {
+  try {
+    const u = new URL(value);
+    if (!/^(www\.)?(huggingface\.co|hf\.co)$/i.test(u.hostname)) return false;
+    const parts = u.pathname.split("/").filter(Boolean);
+    return parts.length === 2 || (parts.length >= 4 && parts[2] === "tree");
+  } catch (_) { return false; }
+}
+
+async function openExplorer(value, defaultFolder) {
+  state.explorer = { loading: true };
+  renderExplorer();
+  try {
+    const listing = await apiJson(`/rafaga/hf/files?url=${encodeURIComponent(value)}`);
+    const groups = new Map();
+    for (const f of listing.files) {
+      const key = f.folder || "";
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(f);
+    }
+    // Detected folders first (alphabetical), files without a folder last.
+    const keys = [...groups.keys()].sort((a, b) => (!a) - (!b) || a.localeCompare(b));
+    state.explorer = {
+      listing,
+      groups: new Map(keys.map((k) => [k, groups.get(k)])),
+      folders: new Map(keys.map((k) => [k, k || defaultFolder || ""])),
+      selected: new Set(),
+    };
+  } catch (e) {
+    state.explorer = null;
+    toast("error", e.message);
+  }
+  renderExplorer();
+}
+
+function closeExplorer() {
+  state.explorer = null;
+  renderExplorer();
+}
+
+async function queueSelected() {
+  const s = t();
+  const ex = state.explorer;
+  if (!ex?.listing) return;
+  const folderOf = (f) => ex.folders.get(f.folder || "");
+  const chosen = ex.listing.files.filter((f) => ex.selected.has(f.path));
+  const noFolder = chosen.filter((f) => !folderOf(f));
+  if (noFolder.length) return toast("warn", s.needFolder(noFolder.map((f) => f.filename).join(", ")));
+  const names = new Set();
+  for (const f of chosen) {
+    const key = `${folderOf(f)}/${f.filename}`.toLowerCase();
+    if (names.has(key)) return toast("warn", s.sameName(f.filename));
+    names.add(key);
+  }
+  let queued = 0;
+  for (const f of chosen) {
+    try {
+      onJob(await apiJson("/rafaga/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          url: f.url, folder: folderOf(f), filename: f.filename,
+          sha256: f.sha256 || undefined, connections: connectionsSetting(),
+        }),
+      }));
+      queued++;
+    } catch (e) {
+      toast("error", `${f.filename}: ${e.message}`);
+    }
+  }
+  if (queued) {
+    toast("info", t().missingQueued(queued));
+    if (state.urlInput) state.urlInput.value = "";
+    closeExplorer();
+  }
+}
+
+function renderExplorer() {
+  const box = state.root?.querySelector(".explorer");
+  if (!box) return;
+  const s = t();
+  const ex = state.explorer;
+  box.replaceChildren();
+  if (!ex) return;
+  if (ex.loading) { box.append(el("div", { class: "empty" }, s.exploring)); return; }
+
+  const { listing } = ex;
+  const title = listing.path ? `${listing.repo}/${listing.path}` : listing.repo;
+  box.append(el("div", { class: "row" },
+    el("strong", { class: "name" }, title),
+    el("button", { title: s.close, onclick: closeExplorer }, el("i", { class: "pi pi-times" }))));
+  if (listing.diffusers) box.append(el("div", { class: "warnbox" }, s.diffusersWarn));
+  if (!listing.files.length) {
+    box.append(el("div", { class: "empty" }, s.noModelFiles));
+    return;
+  }
+  box.append(el("div", { class: "hint" }, s.pickHint));
+
+  const folderOptions = (value) => [
+    el("option", { value: "" }, s.chooseFolder),
+    ...state.folders.map((f) => el("option", { value: f.name, title: f.path, selected: f.name === value ? "" : undefined }, f.name)),
+  ];
+  for (const [key, files] of ex.groups) {
+    const selectable = files.filter((f) => !f.exists);
+    const allOn = selectable.length > 0 && selectable.every((f) => ex.selected.has(f.path));
+    const select = el("select", { onchange: (e) => { ex.folders.set(key, e.target.value); } },
+      ...folderOptions(ex.folders.get(key)));
+    select.value = ex.folders.get(key);
+    const group = el("div", { class: "group" },
+      el("label", { class: "group-head", title: s.selectGroup },
+        el("input", {
+          type: "checkbox", checked: allOn ? "" : undefined, disabled: selectable.length ? undefined : "",
+          onchange: (e) => {
+            for (const f of selectable) e.target.checked ? ex.selected.add(f.path) : ex.selected.delete(f.path);
+            renderExplorer();
+          },
+        }),
+        el("span", {}, key || s.noFolder)),
+      select);
+    for (const f of files) {
+      const dir = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
+      group.append(el("label", { class: `file${f.exists ? " exists" : ""}`, title: f.path },
+        el("input", {
+          type: "checkbox", checked: ex.selected.has(f.path) ? "" : undefined, disabled: f.exists ? "" : undefined,
+          onchange: (e) => { e.target.checked ? ex.selected.add(f.path) : ex.selected.delete(f.path); renderExplorer(); },
+        }),
+        el("span", { class: "info" },
+          el("span", { class: "fname" }, f.filename),
+          el("span", { class: "sub" },
+            el("span", { class: "meta" }, [dir, fmtBytes(f.size)].filter(Boolean).join(" · ")),
+            f.exists ? el("span", { class: "badge exists", title: f.installed_in || "" },
+              f.installed_in && f.installed_in !== f.folder ? `${s.installed} · ${f.installed_in}` : s.installed) : null))));
+    }
+    box.append(group);
+  }
+
+  const chosen = listing.files.filter((f) => ex.selected.has(f.path));
+  const total = chosen.reduce((sum, f) => sum + (f.size || 0), 0);
+  box.append(el("div", { class: "row" },
+    el("span", { class: "meta" }, s.selectedSummary(chosen.length, fmtBytes(total))),
+    el("button", { class: "primary", disabled: chosen.length ? undefined : "", onclick: queueSelected },
+      el("i", { class: "pi pi-download" }), " ", s.downloadSelected)));
+  if (listing.skipped) box.append(el("div", { class: "meta" }, s.skippedNote(listing.skipped)));
+  if (listing.truncated) box.append(el("div", { class: "meta" }, s.truncatedNote));
+}
+
 // -------------------------------------------------------------------- UI ---
 const CSS = `
 .rafaga { padding: 12px; display: flex; flex-direction: column; gap: 12px; font-size: 13px; color: var(--fg-color, #ddd); }
@@ -243,6 +422,19 @@ const CSS = `
 .rafaga .badge.error { color: #f87171; border-color: #f8717166; }
 .rafaga .err { color: #f87171; font-size: 12px; }
 .rafaga .empty { color: var(--descrip-text, #999); font-size: 12px; }
+.rafaga button:disabled { opacity: .5; cursor: default; filter: none; }
+.rafaga input[type=checkbox] { width: auto; margin: 2px 0 0; flex: none; cursor: pointer; }
+.rafaga .explorer { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.rafaga .explorer:empty { display: none; }
+.rafaga .hint { color: var(--descrip-text, #999); font-size: 12px; }
+.rafaga .warnbox { border: 1px solid #f59e0b66; color: #fbbf24; border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+.rafaga .group { border: 1px solid var(--border-color, #444); border-radius: 8px; padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }
+.rafaga .group-head { display: flex; align-items: center; gap: 6px; font-weight: 600; cursor: pointer; }
+.rafaga .file { display: flex; align-items: flex-start; gap: 6px; cursor: pointer; }
+.rafaga .file.exists { opacity: .6; cursor: default; }
+.rafaga .file .info { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.rafaga .file .fname { word-break: break-all; }
+.rafaga .file .sub { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; }
 `;
 
 function renderJobs() {
@@ -282,6 +474,7 @@ function mount(root) {
   root.append(el("style", {}, CSS));
 
   const url = el("input", { type: "url", placeholder: s.urlPlaceholder });
+  state.urlInput = url;
   const folder = el("select", {}, el("option", { value: "" }, s.folderAuto),
     ...state.folders.map((f) => el("option", { value: f.name, title: f.path }, f.name)));
   const filename = el("input", { type: "text", placeholder: s.filenamePlaceholder });
@@ -289,6 +482,7 @@ function mount(root) {
   const startUrlDownload = async () => {
     const value = url.value.trim();
     if (!/^https?:\/\//i.test(value)) return toast("warn", s.needUrl);
+    if (isHfRepoUrl(value)) return openExplorer(value, folder.value);
     try {
       onJob(await apiJson("/rafaga/jobs", {
         method: "POST",
@@ -309,7 +503,8 @@ function mount(root) {
     el("details", {},
       el("summary", {}, s.urlSection),
       el("div", { class: "form" }, url, folder, filename,
-        el("button", { onclick: startUrlDownload }, el("i", { class: "pi pi-download" }), " ", s.downloadBtn))),
+        el("button", { onclick: startUrlDownload }, el("i", { class: "pi pi-download" }), " ", s.downloadBtn)),
+      el("div", { class: "explorer" })),
     el("div", { class: "row" },
       el("strong", {}, s.jobsTitle),
       el("button", { onclick: () => apiJson("/rafaga/jobs/clear", { method: "POST" }).then(() => {
@@ -319,6 +514,7 @@ function mount(root) {
     el("div", { class: "jobs" }),
   ));
   renderJobs();
+  renderExplorer();
 }
 
 // -------------------------------------------------------------- register ---

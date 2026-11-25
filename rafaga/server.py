@@ -50,7 +50,26 @@ def model_folders() -> list[str]:
 
 
 def default_dir(folder: str) -> str:
-    return folder_paths.get_folder_paths(folder)[0]
+    """Directory where new files of this folder type are saved.
+
+    ComfyUI Desktop registers the legacy aliases first (models/unet before
+    models/diffusion_models, models/clip before models/text_encoders,
+    models/t2i_adapter before models/controlnet), so prefer the directory
+    named like the folder type and fall back to the first one.
+    """
+    paths = folder_paths.get_folder_paths(folder)
+    for path in paths:
+        if os.path.basename(os.path.normpath(path)).lower() == folder.lower():
+            return path
+    return paths[0]
+
+
+def installed_path(folder: str, filename: str) -> Optional[str]:
+    """Full path of `filename` if it already exists in any directory of the folder type."""
+    try:
+        return folder_paths.get_full_path(folder, filename)
+    except Exception:
+        return None
 
 
 def allowed_extensions(folder: str) -> set[str]:
@@ -81,11 +100,10 @@ def resolve_destination(folder: str, filename: str) -> str:
     return dest
 
 
-def guess_folder(url: str) -> Optional[str]:
-    """Hugging Face repos often mirror ComfyUI's layout: .../resolve/main/vae/x.safetensors"""
-    segments = urllib.parse.urlparse(url).path.split("/")
+def folder_from_segments(segments: list[str]) -> Optional[str]:
+    """Closest path segment that names a model folder (innermost first)."""
     known = set(model_folders())
-    for seg in reversed(segments[:-1]):
+    for seg in reversed(segments):
         if seg in known:
             return seg
         if seg == "unet":
@@ -93,6 +111,11 @@ def guess_folder(url: str) -> Optional[str]:
         if seg == "clip":
             return "text_encoders"
     return None
+
+
+def guess_folder(url: str) -> Optional[str]:
+    """Hugging Face repos often mirror ComfyUI's layout: .../resolve/main/vae/x.safetensors"""
+    return folder_from_segments(urllib.parse.urlparse(url).path.split("/")[:-1])
 
 
 def auth_headers(url: str) -> dict:
@@ -128,6 +151,133 @@ async def _rescan_assets() -> None:
             log.debug("Ráfaga: no se pudo re-escanear los assets: %s", e)
             return
         await asyncio.sleep(2)
+
+
+# ----------------------------------------------------------- hugging face ---
+
+HF_BASE = "https://huggingface.co"
+HF_HOSTS = {"huggingface.co", "www.huggingface.co", "hf.co"}
+HF_MAX_PAGES = 20         # the tree API pages at ~1000 entries
+HF_MAX_FILES = 2000       # model files returned at most
+_HF_NOT_REPOS = {"api", "blog", "chat", "collections", "datasets", "docs", "join", "learn", "login",
+                 "models", "organizations", "papers", "posts", "pricing", "settings", "spaces", "tasks"}
+_HF_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+@dataclass
+class HFRepo:
+    repo: str          # owner/name
+    revision: str      # branch, tag or commit
+    path: str = ""     # folder inside the repo ("" = everything)
+
+
+def parse_hf_repo_url(url: str) -> Optional[HFRepo]:
+    """Recognise a link to a whole Hugging Face model repo or to one of its folders.
+
+        https://huggingface.co/<owner>/<name>
+        https://huggingface.co/<owner>/<name>/tree/<revision>/<folder>
+
+    Links to a single file (/resolve/, /blob/) and anything else return None.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url.strip())
+        host = (parsed.hostname or "").lower()
+    except ValueError:
+        return None
+    if parsed.scheme not in ("http", "https") or host not in HF_HOSTS:
+        return None
+    parts = [urllib.parse.unquote(p) for p in parsed.path.split("/") if p]
+    if len(parts) < 2 or parts[0] in _HF_NOT_REPOS:
+        return None
+    if not (_HF_ID.match(parts[0]) and _HF_ID.match(parts[1])):
+        return None
+    repo = f"{parts[0]}/{parts[1]}"
+    if len(parts) == 2:
+        return HFRepo(repo, "main")
+    if parts[2] != "tree" or len(parts) < 4 or not parts[3]:
+        return None
+    sub = parts[4:]
+    if any(p in (".", "..") for p in sub):
+        return None
+    return HFRepo(repo, parts[3], "/".join(sub))
+
+
+def hf_file_url(info: HFRepo, path: str) -> str:
+    q = urllib.parse.quote
+    return f"{HF_BASE}/{q(info.repo, safe='/')}/resolve/{q(info.revision, safe='')}/{q(path, safe='/')}"
+
+
+def _hf_tree_url(info: HFRepo) -> str:
+    q = urllib.parse.quote
+    url = f"{HF_BASE}/api/models/{q(info.repo, safe='/')}/tree/{q(info.revision, safe='')}"
+    if info.path:
+        url += "/" + q(info.path, safe="/")
+    return url + "?recursive=true"
+
+
+async def list_hf_repo(session: aiohttp.ClientSession, info: HFRepo) -> dict:
+    """Model files of a Hugging Face repo, with size, SHA-256 and a suggested folder."""
+    url = _hf_tree_url(info)
+    api_host = urllib.parse.urlparse(HF_BASE).netloc
+    entries: list = []
+    truncated = False
+    for page_number in range(HF_MAX_PAGES):
+        async with session.get(url, headers=auth_headers(url)) as r:
+            if r.status in (401, 403):
+                raise DownloadError(
+                    f"Hugging Face no muestra ese repo (HTTP {r.status}): no existe, es privado o pide "
+                    "aceptar condiciones. Si tenés acceso, definí HF_TOKEN antes de abrir ComfyUI.")
+            if r.status == 404:
+                raise DownloadError("No encontré esa rama o carpeta en el repo (HTTP 404)")
+            if r.status >= 400:
+                raise DownloadError(f"Hugging Face respondió HTTP {r.status}")
+            page = await r.json(content_type=None)
+            next_link = r.links.get("next")
+            next_url = str(next_link.get("url")) if next_link else None
+        if not isinstance(page, list):
+            raise DownloadError("Hugging Face respondió algo inesperado")
+        entries.extend(e for e in page if isinstance(e, dict))
+        # Follow pagination only on the same host (never send HF_TOKEN elsewhere).
+        if not next_url or urllib.parse.urlparse(next_url).netloc != api_host:
+            break
+        if page_number == HF_MAX_PAGES - 1:
+            truncated = True
+        url = next_url
+
+    model_exts = set(folder_paths.supported_pt_extensions) | EXTRA_EXTENSIONS
+    files, skipped, diffusers = [], 0, False
+    for entry in entries:
+        if entry.get("type") != "file":
+            continue
+        path = str(entry.get("path", ""))
+        name = path.rsplit("/", 1)[-1]
+        if name == "model_index.json":
+            diffusers = True  # a repo for the diffusers library, not single-file models
+        if os.path.splitext(name)[1].lower() not in model_exts or _BAD_NAME.search(name):
+            skipped += 1
+            continue
+        lfs = entry.get("lfs") if isinstance(entry.get("lfs"), dict) else {}
+        sha = str(lfs.get("oid", "")).lower()
+        size = lfs.get("size", entry.get("size"))
+        folder = folder_from_segments(path.split("/")[:-1])
+        # Where it is already installed: in its folder, or anywhere if no folder was detected.
+        candidates = [folder] if folder else model_folders()
+        installed_in = next((c for c in candidates if installed_path(c, name)), None)
+        files.append({
+            "path": path,
+            "filename": name,
+            "size": size if isinstance(size, int) else None,
+            "sha256": sha if _SHA256.match(sha) else None,
+            "url": hf_file_url(info, path),
+            "folder": folder,
+            "exists": installed_in is not None,
+            "installed_in": installed_in,
+        })
+    files.sort(key=lambda f: f["path"].lower())
+    if len(files) > HF_MAX_FILES:
+        files, truncated = files[:HF_MAX_FILES], True
+    return {"repo": info.repo, "revision": info.revision, "path": info.path, "diffusers": diffusers,
+            "files": files, "skipped": skipped, "truncated": truncated}
 
 
 # ------------------------------------------------------------------- jobs ---
@@ -188,6 +338,10 @@ class JobManager:
 
     def add(self, job: Job) -> Job:
         self.jobs[job.id] = job
+        # The file may already be in another directory of the same type (e.g. models/unet).
+        installed = installed_path(job.folder, job.filename)
+        if installed and os.path.isfile(installed):
+            job.dest = installed
         if os.path.exists(job.dest):
             job.status, job.finished = "exists", time.time()
             job.total = job.done = os.path.getsize(job.dest)
@@ -326,6 +480,22 @@ async def post_job(request: web.Request) -> web.Response:
     job = manager.add(Job(url=url, folder=folder, filename=filename, dest=dest,
                           connections=connections, expected_sha256=sha))
     return web.json_response(job.to_dict())
+
+
+@routes.get("/rafaga/hf/files")
+async def get_hf_files(request: web.Request) -> web.Response:
+    """Model files of a Hugging Face repo (or a folder of it), to pick which ones to download."""
+    info = parse_hf_repo_url(request.query.get("url", ""))
+    if info is None:
+        return _json_error("No es un link a un repo de Hugging Face (huggingface.co/<dueño>/<repo>)")
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
+            listing = await list_hf_repo(session, info)
+    except DownloadError as e:
+        return _json_error(str(e))
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        return _json_error(f"No se pudo consultar Hugging Face: {e}", 502)
+    return web.json_response(listing)
 
 
 @routes.post("/rafaga/jobs/{job_id}/cancel")

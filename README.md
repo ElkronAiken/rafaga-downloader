@@ -16,6 +16,7 @@ Muchas conexiones a internet limitan la velocidad **por conexión**: el navegado
 - ✅ **Verificación SHA-256** automática cuando el servidor publica el hash (Hugging Face lo hace) o cuando el workflow lo declara. Si no coincide, el archivo se descarta.
 - 🔁 **Reanudación**: si se corta la conexión o se cierra ComfyUI, retoma desde donde quedó.
 - 🧩 **Modelos faltantes en un clic**: lee los modelos que declara el workflow abierto (los que muestra «Missing Models»), se fija cuáles faltan y los pone en cola.
+- 📂 **Repos de Hugging Face**: pegás el link de un repo (o de una carpeta del repo), elegís qué archivos bajar y van todos a la cola, cada uno a su carpeta y con su SHA-256.
 - 🔄 **Sin «Missing Models» fantasma**: al terminar refresca las listas de modelos y el índice de assets de ComfyUI.
 - 🛡️ **Seguro**: solo escribe dentro de las carpetas de modelos, solo extensiones de modelo (`.safetensors`, `.ckpt`, `.gguf`…) y nunca sale de la carpeta elegida.
 - 🌎 Interfaz en **español** e **inglés** (según el idioma de ComfyUI).
@@ -32,6 +33,9 @@ No necesita dependencias extra: usa `aiohttp`, que ya viene con ComfyUI.
 1. Abrí el panel **Ráfaga** (ícono ⚡ en la barra lateral).
 2. **Bajar modelos faltantes del workflow**: baja todo lo que el workflow abierto necesita y todavía no tenés.
 3. **Descargar desde una URL**: pegá un enlace directo (por ejemplo `https://huggingface.co/<repo>/resolve/main/vae/modelo.safetensors`). La carpeta se deduce de la URL cuando el repo usa la estructura de ComfyUI; si no, elegila.
+4. **Elegir archivos de un repo de Hugging Face**: pegá el link del repo (`https://huggingface.co/Comfy-Org/Qwen-Image`) o de una carpeta (`…/tree/main/split_files`). Ráfaga muestra solo los archivos de modelo, agrupados por carpeta de destino, con su tamaño y marcando los que ya tenés. Tildá los que quieras y tocá **Bajar seleccionados**. Si no se puede deducir la carpeta de algún archivo, te pide que la elijas.
+
+> **No hace falta bajar todo el repo.** Un repo suele traer variantes del mismo modelo: precisiones (`bf16`, `fp8`, `nvfp4`), versiones `ema`/`nonema` o el mismo archivo en `.ckpt` y `.safetensors`. Para un workflow alcanza con uno de cada rol (modelo, text encoder y VAE) o con un solo checkpoint. Si tenés el workflow, el botón de modelos faltantes baja exactamente los que pide.
 
 También está el comando **«Ráfaga: bajar modelos faltantes»** en el menú *Extensions → Ráfaga* y en la paleta de comandos. Las conexiones por archivo se ajustan en *Configuración → Ráfaga*.
 
@@ -46,7 +50,7 @@ Definí la variable de entorno `HF_TOKEN` antes de abrir ComfyUI. Ráfaga la env
 3. Verifica el tamaño y el SHA-256, y recién entonces renombra al nombre final.
 4. Refresca las listas de modelos de ComfyUI.
 
-API local (la usa la interfaz): `GET /rafaga/folders`, `GET /rafaga/jobs`, `POST /rafaga/jobs`, `POST /rafaga/jobs/{id}/cancel`, `POST /rafaga/jobs/clear`, `POST /rafaga/check`.
+API local (la usa la interfaz): `GET /rafaga/folders`, `GET /rafaga/jobs`, `POST /rafaga/jobs`, `POST /rafaga/jobs/{id}/cancel`, `POST /rafaga/jobs/clear`, `POST /rafaga/check`, `GET /rafaga/hf/files?url=<repo>`.
 
 ## Desarrollo
 
@@ -72,9 +76,9 @@ Después actualiza `pyproject.toml`, crea la etiqueta `vX.Y.Z`, publica en el [C
 
 **Ráfaga** downloads ComfyUI models by splitting each file into several HTTP range requests fetched **in parallel**, **verifies SHA-256** against the hash Hugging Face publishes, **resumes** interrupted downloads and drops the file into the right models folder.
 
-- ⚡ 1–16 connections per file (default 8) · ✅ SHA-256 verification · 🔁 resume · 🧩 one-click download of the open workflow's missing models · 🔄 refreshes model lists and the asset index when done · 🛡️ writes only model files inside model folders.
+- ⚡ 1–16 connections per file (default 8) · ✅ SHA-256 verification · 🔁 resume · 🧩 one-click download of the open workflow's missing models · 📂 pick files from a Hugging Face repo and queue them · 🔄 refreshes model lists and the asset index when done · 🛡️ writes only model files inside model folders.
 - **Install**: search for "Ráfaga" / `rafaga-downloader` in ComfyUI Manager, `comfy node install rafaga-downloader`, or clone into `ComfyUI/custom_nodes/`.
-- **Use**: open the ⚡ **Ráfaga** sidebar tab → *Download this workflow's missing models*, or paste a direct URL. Gated Hugging Face models: set `HF_TOKEN` (sent only to huggingface.co).
+- **Use**: open the ⚡ **Ráfaga** sidebar tab → *Download this workflow's missing models*, paste a direct file URL, or paste a Hugging Face repo/folder link (`https://huggingface.co/Comfy-Org/Qwen-Image`, `…/tree/main/split_files`) to choose which model files to download. A repo usually holds variants of the same model, so you rarely need all of it. Gated Hugging Face models: set `HF_TOKEN` (sent only to huggingface.co).
 - Releases are automatic on every push to `main`, driven by Conventional Commits.
 
 ## License
