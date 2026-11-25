@@ -32,7 +32,7 @@ No necesita dependencias extra: usa `aiohttp`, que ya viene con ComfyUI.
 
 1. Abrí el panel **Ráfaga** (ícono ⚡ en la barra lateral).
 2. **Bajar modelos faltantes del workflow**: baja todo lo que el workflow abierto necesita y todavía no tenés.
-3. **Descargar desde una URL**: pegá un enlace directo (por ejemplo `https://huggingface.co/<repo>/resolve/main/vae/modelo.safetensors`). La carpeta se deduce de la URL cuando el repo usa la estructura de ComfyUI; si no, elegila.
+3. **Descargar desde una URL**: pegá un enlace directo (por ejemplo `https://huggingface.co/<repo>/resolve/main/vae/modelo.safetensors`). La carpeta se deduce de la URL cuando el repo usa la estructura de ComfyUI. Si no se puede deducir, elegila en la lista; con un link de Hugging Face, el archivo se abre en el explorador (punto 4) para elegirla ahí y ver si ya lo tenés.
 4. **Elegir archivos de un repo de Hugging Face**: pegá el link del repo (`https://huggingface.co/Comfy-Org/Qwen-Image`) o de una carpeta (`…/tree/main/split_files`). Ráfaga muestra solo los archivos de modelo, agrupados por carpeta de destino, con su tamaño y marcando los que ya tenés. Tildá los que quieras y tocá **Bajar seleccionados**. Si no se puede deducir la carpeta de algún archivo, te pide que la elijas.
 
 > **No hace falta bajar todo el repo.** Un repo suele traer variantes del mismo modelo: precisiones (`bf16`, `fp8`, `nvfp4`), versiones `ema`/`nonema` o el mismo archivo en `.ckpt` y `.safetensors`. Para un workflow alcanza con uno de cada rol (modelo, text encoder y VAE) o con un solo checkpoint. Si tenés el workflow, el botón de modelos faltantes baja exactamente los que pide.

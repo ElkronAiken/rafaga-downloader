@@ -80,23 +80,33 @@ def allowed_extensions(folder: str) -> set[str]:
     return allowed
 
 
+class InvalidDestination(ValueError):
+    """The requested folder/filename is not allowed (with a code for the interface)."""
+
+    def __init__(self, message: str, code: str, **params) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
+
+
 def resolve_destination(folder: str, filename: str) -> str:
     """Absolute path for `filename` inside the folder's default directory.
 
     Rejects unknown folders, path traversal, odd characters and non-model extensions.
     """
     if folder not in model_folders():
-        raise ValueError(f"Carpeta de modelos desconocida: {folder}")
+        raise InvalidDestination(f"Carpeta de modelos desconocida: {folder}", "unknown_folder", folder=folder)
     parts = [p for p in filename.replace("\\", "/").split("/") if p not in ("", ".")]
     if not parts or any(p == ".." or _BAD_NAME.search(p) for p in parts):
-        raise ValueError(f"Nombre de archivo inválido: {filename}")
+        raise InvalidDestination(f"Nombre de archivo inválido: {filename}", "bad_filename", filename=filename)
     ext = os.path.splitext(parts[-1])[1].lower()
     if ext not in allowed_extensions(folder):
-        raise ValueError(f"Extensión no permitida para modelos: {ext or '(sin extensión)'}")
+        raise InvalidDestination(f"Extensión no permitida para modelos: {ext or '(sin extensión)'}",
+                                 "bad_extension", ext=ext)
     base = os.path.abspath(default_dir(folder))
     dest = os.path.abspath(os.path.join(base, *parts))
     if os.path.commonpath([dest, base]) != base:
-        raise ValueError("La ruta de destino sale de la carpeta de modelos")
+        raise InvalidDestination("La ruta de destino sale de la carpeta de modelos", "outside_folder")
     return dest
 
 
@@ -171,14 +181,8 @@ class HFRepo:
     path: str = ""     # folder inside the repo ("" = everything)
 
 
-def parse_hf_repo_url(url: str) -> Optional[HFRepo]:
-    """Recognise a link to a whole Hugging Face model repo or to one of its folders.
-
-        https://huggingface.co/<owner>/<name>
-        https://huggingface.co/<owner>/<name>/tree/<revision>/<folder>
-
-    Links to a single file (/resolve/, /blob/) and anything else return None.
-    """
+def _hf_url_parts(url: str) -> Optional[list[str]]:
+    """Decoded path segments of a huggingface.co link to a model repo, or None."""
     try:
         parsed = urllib.parse.urlparse(url.strip())
         host = (parsed.hostname or "").lower()
@@ -191,15 +195,41 @@ def parse_hf_repo_url(url: str) -> Optional[HFRepo]:
         return None
     if not (_HF_ID.match(parts[0]) and _HF_ID.match(parts[1])):
         return None
+    if any(p in (".", "..") for p in parts[2:]):
+        return None
+    return parts
+
+
+def parse_hf_repo_url(url: str) -> Optional[HFRepo]:
+    """Recognise a link to a whole Hugging Face model repo or to one of its folders.
+
+        https://huggingface.co/<owner>/<name>
+        https://huggingface.co/<owner>/<name>/tree/<revision>/<folder>
+
+    Links to a single file (/resolve/, /blob/) and anything else return None.
+    """
+    parts = _hf_url_parts(url)
+    if parts is None:
+        return None
     repo = f"{parts[0]}/{parts[1]}"
     if len(parts) == 2:
         return HFRepo(repo, "main")
     if parts[2] != "tree" or len(parts) < 4 or not parts[3]:
         return None
-    sub = parts[4:]
-    if any(p in (".", "..") for p in sub):
+    return HFRepo(repo, parts[3], "/".join(parts[4:]))
+
+
+def parse_hf_file_url(url: str) -> Optional[tuple[HFRepo, str]]:
+    """Recognise a link to one file of a Hugging Face repo (/blob/ or /resolve/).
+
+    Returns the repo with `path` set to the file's folder, and the file's path.
+    """
+    parts = _hf_url_parts(url)
+    if parts is None or len(parts) < 5 or parts[2] not in ("blob", "resolve") or not parts[3]:
         return None
-    return HFRepo(repo, parts[3], "/".join(sub))
+    file_path = "/".join(parts[4:])
+    folder = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
+    return HFRepo(f"{parts[0]}/{parts[1]}", parts[3], folder), file_path
 
 
 def hf_file_url(info: HFRepo, path: str) -> str:
@@ -207,17 +237,21 @@ def hf_file_url(info: HFRepo, path: str) -> str:
     return f"{HF_BASE}/{q(info.repo, safe='/')}/resolve/{q(info.revision, safe='')}/{q(path, safe='/')}"
 
 
-def _hf_tree_url(info: HFRepo) -> str:
+def _hf_tree_url(info: HFRepo, recursive: bool = True) -> str:
     q = urllib.parse.quote
     url = f"{HF_BASE}/api/models/{q(info.repo, safe='/')}/tree/{q(info.revision, safe='')}"
     if info.path:
         url += "/" + q(info.path, safe="/")
-    return url + "?recursive=true"
+    return url + ("?recursive=true" if recursive else "")
 
 
-async def list_hf_repo(session: aiohttp.ClientSession, info: HFRepo) -> dict:
-    """Model files of a Hugging Face repo, with size, SHA-256 and a suggested folder."""
-    url = _hf_tree_url(info)
+async def list_hf_repo(session: aiohttp.ClientSession, info: HFRepo, only: Optional[str] = None) -> dict:
+    """Model files of a Hugging Face repo, with size, SHA-256 and a suggested folder.
+
+    With `only` (a file path inside the repo), lists just that file: its folder
+    (`info.path`) is read without recursion and everything else is dropped.
+    """
+    url = _hf_tree_url(info, recursive=only is None)
     api_host = urllib.parse.urlparse(HF_BASE).netloc
     entries: list = []
     truncated = False
@@ -226,17 +260,22 @@ async def list_hf_repo(session: aiohttp.ClientSession, info: HFRepo) -> dict:
             if r.status in (401, 403):
                 raise DownloadError(
                     f"Hugging Face no muestra ese repo (HTTP {r.status}): no existe, es privado o pide "
-                    "aceptar condiciones. Si tenés acceso, definí HF_TOKEN antes de abrir ComfyUI.")
+                    "aceptar condiciones. Si tenés acceso, definí HF_TOKEN antes de abrir ComfyUI.",
+                    "hf_denied", status=r.status)
             if r.status == 404:
-                raise DownloadError("No encontré esa rama o carpeta en el repo (HTTP 404)")
+                raise DownloadError("No encontré esa rama o carpeta en el repo (HTTP 404)", "hf_not_found")
             if r.status >= 400:
-                raise DownloadError(f"Hugging Face respondió HTTP {r.status}")
+                raise DownloadError(f"Hugging Face respondió HTTP {r.status}", "hf_http", status=r.status)
             page = await r.json(content_type=None)
             next_link = r.links.get("next")
             next_url = str(next_link.get("url")) if next_link else None
         if not isinstance(page, list):
-            raise DownloadError("Hugging Face respondió algo inesperado")
+            raise DownloadError("Hugging Face respondió algo inesperado", "hf_unexpected")
+        if only is not None:
+            page = [e for e in page if isinstance(e, dict) and e.get("path") == only]
         entries.extend(e for e in page if isinstance(e, dict))
+        if only is not None and entries:
+            break  # found the file
         # Follow pagination only on the same host (never send HF_TOKEN elsewhere).
         if not next_url or urllib.parse.urlparse(next_url).netloc != api_host:
             break
@@ -273,11 +312,13 @@ async def list_hf_repo(session: aiohttp.ClientSession, info: HFRepo) -> dict:
             "exists": installed_in is not None,
             "installed_in": installed_in,
         })
+    if only is not None and not entries:
+        raise DownloadError("No encontré ese archivo en el repo", "hf_file_not_found")
     files.sort(key=lambda f: f["path"].lower())
     if len(files) > HF_MAX_FILES:
         files, truncated = files[:HF_MAX_FILES], True
-    return {"repo": info.repo, "revision": info.revision, "path": info.path, "diffusers": diffusers,
-            "files": files, "skipped": skipped, "truncated": truncated}
+    return {"repo": info.repo, "revision": info.revision, "path": info.path, "file": only,
+            "diffusers": diffusers, "files": files, "skipped": skipped, "truncated": truncated}
 
 
 # ------------------------------------------------------------------- jobs ---
@@ -298,6 +339,8 @@ class Job:
     active_connections: int = 0
     verified: bool = False
     error: Optional[str] = None
+    error_code: Optional[str] = None      # lets the interface translate `error`
+    error_params: dict = field(default_factory=dict)
     created: float = field(default_factory=time.time)
     finished: Optional[float] = None
     task: Optional[asyncio.Task] = field(default=None, repr=False)
@@ -310,6 +353,7 @@ class Job:
             "total": self.total, "done": self.done, "speed": self.speed,
             "active_connections": self.active_connections, "verified": self.verified,
             "expected_sha256": self.expected_sha256, "error": self.error,
+            "error_code": self.error_code, "error_params": self.error_params,
             "created": self.created, "finished": self.finished,
         }
 
@@ -395,10 +439,11 @@ class JobManager:
             if job.download is not None:
                 job.download.discard()
         except DownloadError as e:
-            job.status, job.error = "error", str(e)
+            job.status, job.error, job.error_code, job.error_params = "error", str(e), e.code, e.params
         except Exception as e:  # never let a bug kill the server loop silently
             log.exception("Ráfaga: error inesperado")
-            job.status, job.error = "error", f"{type(e).__name__}: {e}"
+            detail = f"{type(e).__name__}: {e}"
+            job.status, job.error, job.error_code, job.error_params = "error", detail, "unexpected", {"detail": detail}
         finally:
             job.finished = time.time()
             job.speed = 0.0
@@ -414,8 +459,14 @@ manager = JobManager()
 routes = PromptServer.instance.routes
 
 
-def _json_error(message: str, status: int = 400) -> web.Response:
-    return web.json_response({"error": message}, status=status)
+def _json_error(message: str, status: int = 400, code: str = "error",
+                params: Optional[dict] = None) -> web.Response:
+    """Error response; the interface shows `code` in its language and `error` as the fallback."""
+    return web.json_response({"error": message, "code": code, "params": params or {}}, status=status)
+
+
+def _error_response(e: Exception, status: int = 400) -> web.Response:
+    return _json_error(str(e), status, getattr(e, "code", "error"), getattr(e, "params", None))
 
 
 @routes.get("/rafaga/folders")
@@ -440,15 +491,15 @@ async def post_job(request: web.Request) -> web.Response:
     try:
         body = await request.json()
     except Exception:
-        return _json_error("JSON inválido")
+        return _json_error("JSON inválido", code="bad_json")
 
     url = str(body.get("url", "")).strip()
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
-        return _json_error("La URL tiene que empezar con http:// o https://")
+        return _json_error("La URL tiene que empezar con http:// o https://", code="bad_url")
 
     folder = (body.get("folder") or guess_folder(url) or "").strip()
     if not folder:
-        return _json_error("Elegí la carpeta de destino (no se pudo deducir de la URL)")
+        return _json_error("Elegí la carpeta de destino (no se pudo deducir de la URL)", code="need_folder")
 
     try:
         connections = int(body.get("connections") or DEFAULT_CONNECTIONS)
@@ -466,12 +517,12 @@ async def post_job(request: web.Request) -> web.Response:
                 info = await probe(session, url, auth_headers(url))
             filename = info.filename or filename
         except DownloadError as e:
-            return _json_error(str(e))
+            return _error_response(e)
 
     try:
         dest = resolve_destination(folder, filename)
     except ValueError as e:
-        return _json_error(str(e))
+        return _error_response(e)
 
     existing = manager.find_active(dest)
     if existing:
@@ -484,17 +535,20 @@ async def post_job(request: web.Request) -> web.Response:
 
 @routes.get("/rafaga/hf/files")
 async def get_hf_files(request: web.Request) -> web.Response:
-    """Model files of a Hugging Face repo (or a folder of it), to pick which ones to download."""
-    info = parse_hf_repo_url(request.query.get("url", ""))
+    """Model files of a Hugging Face repo, a folder of it or a single file, to pick what to download."""
+    url = request.query.get("url", "")
+    info, only = parse_hf_repo_url(url), None
+    if info is None and (file_link := parse_hf_file_url(url)) is not None:
+        info, only = file_link
     if info is None:
-        return _json_error("No es un link a un repo de Hugging Face (huggingface.co/<dueño>/<repo>)")
+        return _json_error("No es un link a un repo de Hugging Face (huggingface.co/<dueño>/<repo>)", code="not_repo")
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as session:
-            listing = await list_hf_repo(session, info)
+            listing = await list_hf_repo(session, info, only)
     except DownloadError as e:
-        return _json_error(str(e))
+        return _error_response(e)
     except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
-        return _json_error(f"No se pudo consultar Hugging Face: {e}", 502)
+        return _json_error(f"No se pudo consultar Hugging Face: {e}", 502, "hf_connect", {"detail": str(e)})
     return web.json_response(listing)
 
 
@@ -502,7 +556,7 @@ async def get_hf_files(request: web.Request) -> web.Response:
 async def cancel_job(request: web.Request) -> web.Response:
     job = manager.cancel(request.match_info["job_id"])
     if job is None:
-        return _json_error("No existe esa descarga", 404)
+        return _json_error("No existe esa descarga", 404, "job_not_found")
     return web.json_response(job.to_dict())
 
 
@@ -520,7 +574,7 @@ async def check_models(request: web.Request) -> web.Response:
         models = body.get("models", [])
         assert isinstance(models, list)
     except Exception:
-        return _json_error("JSON inválido")
+        return _json_error("JSON inválido", code="bad_json")
     results = []
     for m in models[:500]:
         name = str(m.get("name", ""))

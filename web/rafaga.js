@@ -40,6 +40,7 @@ const STRINGS = {
     diffusersWarn: "Este repo está en formato diffusers (para la librería diffusers). ComfyUI suele usar archivos únicos: buscá una versión del modelo para ComfyUI (por ejemplo, de Comfy-Org).",
     noModelFiles: "No hay archivos de modelo en este repo o carpeta.",
     noFolder: "Carpeta no detectada",
+    folderHint: "¿Dónde va? checkpoints: modelo completo · diffusion_models: solo el modelo de difusión · text_encoders: text encoder · vae: VAE · loras: LoRA.",
     chooseFolder: "Elegí la carpeta…",
     selectGroup: "Seleccionar todos los de esta carpeta",
     installed: "Ya está",
@@ -85,6 +86,7 @@ const STRINGS = {
     diffusersWarn: "This repo uses the diffusers format (for the diffusers library). ComfyUI usually loads single files: look for a ComfyUI version of the model (for example, from Comfy-Org).",
     noModelFiles: "There are no model files in this repo or folder.",
     noFolder: "Folder not detected",
+    folderHint: "Where does it go? checkpoints: full model · diffusion_models: diffusion model only · text_encoders: text encoder · vae: VAE · loras: LoRA.",
     chooseFolder: "Choose a folder…",
     selectGroup: "Select every file in this folder",
     installed: "Installed",
@@ -97,6 +99,69 @@ const STRINGS = {
     close: "Close",
   },
 };
+
+// Server errors arrive with a code (and params); the Spanish text the server sends is the fallback.
+const ERRORS = {
+  es: {
+    bad_json: () => "Pedido inválido",
+    bad_url: () => "La URL tiene que empezar con http:// o https://",
+    need_folder: () => "Elegí la carpeta de destino en la lista (no se pudo deducir de la URL)",
+    unknown_folder: (p) => `Carpeta de modelos desconocida: ${p.folder}`,
+    bad_filename: (p) => `Nombre de archivo inválido: ${p.filename}`,
+    bad_extension: (p) => `Extensión no permitida para modelos: ${p.ext || "(sin extensión)"}`,
+    outside_folder: () => "La ruta de destino sale de la carpeta de modelos",
+    not_repo: () => "No es un link a un repo de Hugging Face (huggingface.co/<dueño>/<repo>)",
+    hf_denied: (p) => `Hugging Face no muestra ese repo (HTTP ${p.status}): no existe, es privado o pide aceptar condiciones. Si tenés acceso, definí HF_TOKEN antes de abrir ComfyUI.`,
+    hf_not_found: () => "No encontré esa rama o carpeta en el repo (HTTP 404)",
+    hf_file_not_found: () => "No encontré ese archivo en el repo",
+    hf_http: (p) => `Hugging Face respondió HTTP ${p.status}`,
+    hf_unexpected: () => "Hugging Face respondió algo inesperado",
+    hf_connect: (p) => `No se pudo consultar Hugging Face: ${p.detail}`,
+    job_not_found: () => "No existe esa descarga",
+    access_denied: (p) => `Acceso denegado (HTTP ${p.status}). ¿El modelo requiere token?`,
+    not_found: () => "No encontrado (HTTP 404)",
+    connect_failed: (p) => `No se pudo conectar: ${p.detail}`,
+    wrong_size: (p) => `Tamaño incorrecto: ${p.actual} de ${p.size} bytes`,
+    sha_mismatch: () => "El SHA-256 no coincide: el archivo está corrupto y se descartó",
+    no_ranges: (p) => `El servidor respondió HTTP ${p.status} a un pedido por tramos`,
+    segment_failed: (p) => `Un tramo falló ${p.count} veces seguidas: ${p.detail}`,
+    http_status: (p) => `El servidor respondió HTTP ${p.status}`,
+    cancelled: () => "Cancelado",
+    unexpected: (p) => `Error inesperado: ${p.detail}`,
+  },
+  en: {
+    bad_json: () => "Invalid request",
+    bad_url: () => "The URL must start with http:// or https://",
+    need_folder: () => "Choose the destination folder in the list (it couldn't be deduced from the URL)",
+    unknown_folder: (p) => `Unknown model folder: ${p.folder}`,
+    bad_filename: (p) => `Invalid file name: ${p.filename}`,
+    bad_extension: (p) => `File type not allowed for models: ${p.ext || "(no extension)"}`,
+    outside_folder: () => "The destination path leaves the models folder",
+    not_repo: () => "Not a Hugging Face repo link (huggingface.co/<owner>/<repo>)",
+    hf_denied: (p) => `Hugging Face won't show that repo (HTTP ${p.status}): it doesn't exist, it's private or it asks you to accept its terms. If you have access, set HF_TOKEN before opening ComfyUI.`,
+    hf_not_found: () => "Couldn't find that branch or folder in the repo (HTTP 404)",
+    hf_file_not_found: () => "Couldn't find that file in the repo",
+    hf_http: (p) => `Hugging Face answered HTTP ${p.status}`,
+    hf_unexpected: () => "Hugging Face sent an unexpected answer",
+    hf_connect: (p) => `Couldn't reach Hugging Face: ${p.detail}`,
+    job_not_found: () => "That download doesn't exist",
+    access_denied: (p) => `Access denied (HTTP ${p.status}). Does the model need a token?`,
+    not_found: () => "Not found (HTTP 404)",
+    connect_failed: (p) => `Couldn't connect: ${p.detail}`,
+    wrong_size: (p) => `Wrong size: ${p.actual} of ${p.size} bytes`,
+    sha_mismatch: () => "SHA-256 doesn't match: the file is corrupt and was discarded",
+    no_ranges: (p) => `The server answered HTTP ${p.status} to a ranged request`,
+    segment_failed: (p) => `A part failed ${p.count} times in a row: ${p.detail}`,
+    http_status: (p) => `The server answered HTTP ${p.status}`,
+    cancelled: () => "Cancelled",
+    unexpected: (p) => `Unexpected error: ${p.detail}`,
+  },
+};
+
+function errorText(code, params, fallback) {
+  const fn = ERRORS[locale()][code];
+  try { return fn ? fn(params || {}) : fallback; } catch (_) { return fallback; }
+}
 
 function locale() {
   let loc = "";
@@ -145,7 +210,11 @@ async function apiJson(path, options = {}) {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(errorText(data.code, data.params, data.error || `HTTP ${res.status}`));
+    err.code = data.code;
+    throw err;
+  }
   return data;
 }
 
@@ -164,6 +233,10 @@ async function loadJobs() {
   } catch (_) { /* server without the extension loaded */ }
 }
 
+function jobError(job) {
+  return errorText(job.error_code, job.error_params, job.error || "");
+}
+
 function onJob(job) {
   const prev = state.lastStatus.get(job.id);
   state.jobs.set(job.id, job);
@@ -173,7 +246,7 @@ function onJob(job) {
       toast("success", t().doneToast(job.filename) + (job.verified ? ` · ${t().verified}` : ""));
       refreshModelLists();
     } else if (job.status === "error") {
-      toast("error", `${t().errorToast(job.filename)} — ${job.error || ""}`);
+      toast("error", `${t().errorToast(job.filename)} — ${jobError(job)}`);
     }
   }
   renderJobs();
@@ -260,6 +333,15 @@ function isHfRepoUrl(value) {
   } catch (_) { return false; }
 }
 
+function isHfFileUrl(value) {
+  try {
+    const u = new URL(value);
+    if (!/^(www\.)?(huggingface\.co|hf\.co)$/i.test(u.hostname)) return false;
+    const parts = u.pathname.split("/").filter(Boolean);
+    return parts.length >= 5 && (parts[2] === "blob" || parts[2] === "resolve");
+  } catch (_) { return false; }
+}
+
 async function openExplorer(value, defaultFolder) {
   state.explorer = { loading: true };
   renderExplorer();
@@ -277,7 +359,8 @@ async function openExplorer(value, defaultFolder) {
       listing,
       groups: new Map(keys.map((k) => [k, groups.get(k)])),
       folders: new Map(keys.map((k) => [k, k || defaultFolder || ""])),
-      selected: new Set(),
+      // A link to one file comes with that file already ticked (unless it is installed).
+      selected: new Set(listing.file ? listing.files.filter((f) => !f.exists).map((f) => f.path) : []),
     };
   } catch (e) {
     state.explorer = null;
@@ -346,7 +429,7 @@ function renderExplorer() {
     box.append(el("div", { class: "empty" }, s.noModelFiles));
     return;
   }
-  box.append(el("div", { class: "hint" }, s.pickHint));
+  if (!listing.file) box.append(el("div", { class: "hint" }, s.pickHint));
 
   const folderOptions = (value) => [
     el("option", { value: "" }, s.chooseFolder),
@@ -368,7 +451,8 @@ function renderExplorer() {
           },
         }),
         el("span", {}, key || s.noFolder)),
-      select);
+      select,
+      key ? null : el("div", { class: "hint" }, s.folderHint));
     for (const f of files) {
       const dir = f.path.includes("/") ? f.path.slice(0, f.path.lastIndexOf("/")) : "";
       group.append(el("label", { class: `file${f.exists ? " exists" : ""}`, title: f.path },
@@ -462,7 +546,7 @@ function renderJobs() {
         el("span", { class: "meta" }, meta.join(" · ")),
         job.verified ? el("span", { class: "badge ok" }, s.verified) : null,
         active ? el("button", { onclick: () => apiJson(`/rafaga/jobs/${job.id}/cancel`, { method: "POST" }).then(onJob).catch(() => {}) }, s.cancel) : null),
-      job.error ? el("div", { class: "err" }, job.error) : null,
+      job.error ? el("div", { class: "err" }, jobError(job)) : null,
     ));
   }
 }
@@ -482,6 +566,7 @@ function mount(root) {
   const startUrlDownload = async () => {
     const value = url.value.trim();
     if (!/^https?:\/\//i.test(value)) return toast("warn", s.needUrl);
+    closeExplorer();  // a new link replaces whatever was listed before
     if (isHfRepoUrl(value)) return openExplorer(value, folder.value);
     try {
       onJob(await apiJson("/rafaga/jobs", {
@@ -492,7 +577,15 @@ function mount(root) {
         }),
       }));
       url.value = ""; filename.value = "";
-    } catch (e) { toast("error", e.message); }
+    } catch (e) {
+      if (e.code === "need_folder") {
+        // A Hugging Face file: show it in the explorer (installed status + folder picker).
+        if (isHfFileUrl(value)) return openExplorer(value, "");
+        folder.focus();
+        return toast("warn", e.message);
+      }
+      toast("error", e.message);
+    }
   };
 
   root.append(el("div", { class: "rafaga" },

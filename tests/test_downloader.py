@@ -109,10 +109,20 @@ class DownloaderTests(unittest.IsolatedAsyncioTestCase):
     async def test_wrong_hash_is_rejected_and_discarded(self):
         url = await self.serve(sha_header=False)
         job = dl.SegmentedDownload(url, self.dest, connections=4, expected_sha256="0" * 64)
-        with self.assertRaises(dl.DownloadError):
+        with self.assertRaises(dl.DownloadError) as ctx:
             await job.run()
+        self.assertEqual(ctx.exception.code, "sha_mismatch")  # the interface translates it
         self.assertFalse(os.path.exists(self.dest))
         self.assertFalse(os.path.exists(self.dest + dl.PART_SUFFIX))
+
+    async def test_missing_file_error_has_code(self):
+        url = (await self.serve()).replace("model.safetensors", "missing.safetensors")
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            with self.assertRaises(dl.DownloadError) as ctx:
+                await dl.probe(s, url)
+        self.assertEqual(ctx.exception.code, "not_found")
+        self.assertEqual(dl.DownloadCancelled().code, "cancelled")
 
     async def test_server_without_ranges_uses_single_connection(self):
         url = await self.serve(ranges=False)

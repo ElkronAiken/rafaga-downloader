@@ -29,11 +29,23 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class DownloadError(Exception):
-    """A download failed and cannot continue."""
+    """A download failed and cannot continue.
+
+    `code` and `params` let the interface show the message in its own language;
+    the (Spanish) text is the fallback.
+    """
+
+    def __init__(self, message: str, code: str = "error", **params) -> None:
+        super().__init__(message)
+        self.code = code
+        self.params = params
 
 
 class DownloadCancelled(DownloadError):
     """The download was cancelled by the user."""
+
+    def __init__(self, message: str = "Cancelado") -> None:
+        super().__init__(message, "cancelled")
 
 
 @dataclass
@@ -120,9 +132,10 @@ async def probe(session: aiohttp.ClientSession, url: str, headers: Optional[dict
                     size = int(r.headers["Content-Length"])
                 accepts = r.headers.get("Accept-Ranges", "").lower() == "bytes"
             elif r.status in (401, 403):
-                raise DownloadError(f"Acceso denegado (HTTP {r.status}). ¿El modelo requiere token?")
+                raise DownloadError(f"Acceso denegado (HTTP {r.status}). ¿El modelo requiere token?",
+                                    "access_denied", status=r.status)
             elif r.status == 404:
-                raise DownloadError("No encontrado (HTTP 404)")
+                raise DownloadError("No encontrado (HTTP 404)", "not_found")
     except DownloadError:
         raise
     except (aiohttp.ClientError, asyncio.TimeoutError):
@@ -135,9 +148,10 @@ async def probe(session: aiohttp.ClientSession, url: str, headers: Optional[dict
                     sha = sha or _sha256_from_headers(resp.headers)
                     name = name or filename_from_headers(resp.headers.get("Content-Disposition"))
                 if r.status in (401, 403):
-                    raise DownloadError(f"Acceso denegado (HTTP {r.status}). ¿El modelo requiere token?")
+                    raise DownloadError(f"Acceso denegado (HTTP {r.status}). ¿El modelo requiere token?",
+                                    "access_denied", status=r.status)
                 if r.status == 404:
-                    raise DownloadError("No encontrado (HTTP 404)")
+                    raise DownloadError("No encontrado (HTTP 404)", "not_found")
                 final_url = str(r.url)
                 m = re.match(r"bytes \d+-\d+/(\d+)", r.headers.get("Content-Range", ""))
                 if r.status == 206 and m:
@@ -148,7 +162,7 @@ async def probe(session: aiohttp.ClientSession, url: str, headers: Optional[dict
         except DownloadError:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            raise DownloadError(f"No se pudo conectar: {e}") from e
+            raise DownloadError(f"No se pudo conectar: {e}", "connect_failed", detail=str(e)) from e
 
     return Probe(url=url, final_url=final_url, size=size, accepts_ranges=accepts,
                  sha256=sha, filename=name or filename_from_url(final_url) or filename_from_url(url))
@@ -175,7 +189,7 @@ async def sha256_file(path: str, cancel: Optional[asyncio.Event] = None) -> str:
         with open(path, "rb") as f:
             while True:
                 if cancel is not None and cancel.is_set():
-                    raise DownloadCancelled("Cancelado")
+                    raise DownloadCancelled()
                 block = f.read(16 << 20)
                 if not block:
                     break
@@ -317,11 +331,11 @@ class SegmentedDownload:
             await self._single(session)
 
         if self.cancel_event.is_set():
-            raise DownloadCancelled("Cancelado")
+            raise DownloadCancelled()
 
         actual = os.path.getsize(self.part)
         if size is not None and actual != size:
-            raise DownloadError(f"Tamaño incorrecto: {actual} de {size} bytes")
+            raise DownloadError(f"Tamaño incorrecto: {actual} de {size} bytes", "wrong_size", actual=actual, size=size)
 
         if self.expected_sha256:
             self.progress.phase = "verifying"
@@ -329,7 +343,7 @@ class SegmentedDownload:
             digest = await sha256_file(self.part, self.cancel_event)
             if digest != self.expected_sha256:
                 self._cleanup_temp()
-                raise DownloadError("El SHA-256 no coincide: el archivo está corrupto y se descartó")
+                raise DownloadError("El SHA-256 no coincide: el archivo está corrupto y se descartó", "sha_mismatch")
             self.verified = True
 
         os.replace(self.part, self.dest)
@@ -372,13 +386,14 @@ class SegmentedDownload:
         failures = 0
         while not seg.done:
             if self.cancel_event.is_set():
-                raise DownloadCancelled("Cancelado")
+                raise DownloadCancelled()
             start_pos = seg.pos
             try:
                 headers = {**self.headers, "Range": f"bytes={seg.pos}-{seg.end}"}
                 async with session.get(self.url, headers=headers, allow_redirects=True) as r:
                     if r.status != 206:
-                        raise DownloadError(f"El servidor respondió HTTP {r.status} a un pedido por tramos")
+                        raise DownloadError(f"El servidor respondió HTTP {r.status} a un pedido por tramos",
+                                            "no_ranges", status=r.status)
                     with open(self.part, "r+b") as f:
                         f.seek(seg.pos)
                         buf = bytearray()
@@ -393,7 +408,7 @@ class SegmentedDownload:
                         try:
                             async for chunk in r.content.iter_chunked(READ_CHUNK):
                                 if self.cancel_event.is_set():
-                                    raise DownloadCancelled("Cancelado")
+                                    raise DownloadCancelled()
                                 room = seg.end + 1 - (seg.pos + len(buf))
                                 if room <= 0:
                                     break
@@ -411,7 +426,8 @@ class SegmentedDownload:
                     continue
                 failures += 1
                 if failures > MAX_RETRIES:
-                    raise DownloadError(f"Un tramo falló {failures} veces seguidas: {e}") from e
+                    raise DownloadError(f"Un tramo falló {failures} veces seguidas: {e}", "segment_failed",
+                                        count=failures, detail=str(e)) from e
                 await asyncio.sleep(min(2 ** failures, 30))
 
     async def _single(self, session: aiohttp.ClientSession) -> None:
@@ -423,10 +439,10 @@ class SegmentedDownload:
         self._emit()
         async with session.get(self.url, headers=self.headers, allow_redirects=True) as r:
             if r.status >= 400:
-                raise DownloadError(f"HTTP {r.status}")
+                raise DownloadError(f"HTTP {r.status}", "http_status", status=r.status)
             with open(self.part, "wb") as f:
                 async for chunk in r.content.iter_chunked(READ_CHUNK):
                     if self.cancel_event.is_set():
-                        raise DownloadCancelled("Cancelado")
+                        raise DownloadCancelled()
                     f.write(chunk)
                     self._count(len(chunk))

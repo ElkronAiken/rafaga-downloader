@@ -1,5 +1,6 @@
 """Tests for the path/folder validation in rafaga.server, using stand-ins for ComfyUI modules."""
 
+import json
 import os
 import sys
 import tempfile
@@ -125,6 +126,30 @@ class ServerHelperTests(unittest.TestCase):
             self.assertIsNone(job.task)
         finally:
             rs.manager.jobs.pop(job.id, None)
+
+    def test_destination_errors_have_codes(self):
+        cases = [
+            (("vae", "payload.exe"), "bad_extension", {"ext": ".exe"}),
+            (("vae", "../x.safetensors"), "bad_filename", {"filename": "../x.safetensors"}),
+            (("nope", "x.safetensors"), "unknown_folder", {"folder": "nope"}),
+        ]
+        for args, code, params in cases:
+            with self.assertRaises(rs.InvalidDestination, msg=args) as ctx:
+                rs.resolve_destination(*args)
+            self.assertEqual((ctx.exception.code, ctx.exception.params), (code, params))
+
+    def test_error_response_keeps_http_status_param(self):
+        # A "status" parameter (the remote HTTP code) must not clash with the response status.
+        resp = rs._error_response(rs.DownloadError("Acceso denegado (HTTP 401)", "access_denied", status=401))
+        self.assertEqual(resp.status, 400)
+        self.assertEqual(json.loads(resp.text),
+                         {"error": "Acceso denegado (HTTP 401)", "code": "access_denied", "params": {"status": 401}})
+
+    def test_job_dict_carries_error_code(self):
+        job = rs.Job(url="u", folder="vae", filename="x.safetensors", dest="d", connections=1,
+                     error="El SHA-256 no coincide", error_code="sha_mismatch")
+        data = job.to_dict()
+        self.assertEqual((data["error_code"], data["error_params"]), ("sha_mismatch", {}))
 
     def test_auth_header_only_for_hugging_face(self):
         os.environ["HF_TOKEN"] = "hf_test"
@@ -274,6 +299,64 @@ class HuggingFaceRepoTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(rs.DownloadError) as ctx:
                 await rs.list_hf_repo(session, info)
         self.assertIn("HF_TOKEN", str(ctx.exception))
+
+    def test_parse_file_urls(self):
+        p = rs.parse_hf_file_url
+        self.assertEqual(p("https://huggingface.co/Comfy-Org/stable-diffusion-2.1/blob/main/512-inpainting-ema.safetensors"),
+                         (rs.HFRepo("Comfy-Org/stable-diffusion-2.1", "main", ""), "512-inpainting-ema.safetensors"))
+        self.assertEqual(p("https://huggingface.co/a/b/resolve/v2/split_files/vae/x.safetensors?download=true"),
+                         (rs.HFRepo("a/b", "v2", "split_files/vae"), "split_files/vae/x.safetensors"))
+        for not_file in (
+            "https://huggingface.co/a/b",
+            "https://huggingface.co/a/b/tree/main/vae",
+            "https://huggingface.co/a/b/blob/main",
+            "https://huggingface.co/a/b/blob/main/../../x.safetensors",
+            "https://huggingface.co/datasets/a/b/blob/main/x.safetensors",
+            "https://evil.example/a/b/blob/main/x.safetensors",
+        ):
+            self.assertIsNone(p(not_file), not_file)
+
+    async def test_single_file_link_lists_only_that_file(self):
+        seen = []
+        await self.serve(seen=seen)
+        info, only = rs.parse_hf_file_url(
+            "https://huggingface.co/Comfy-Org/Qwen-Image/blob/main/split_files/vae/qwen_vae.safetensors")
+        async with aiohttp.ClientSession() as session:
+            listing = await rs.list_hf_repo(session, info, only)
+        self.assertEqual(len(seen), 1)              # found on the first page
+        self.assertEqual(seen[0], "/api/models/Comfy-Org/Qwen-Image/tree/main/split_files/vae")  # no recursion
+        self.assertEqual(listing["file"], "split_files/vae/qwen_vae.safetensors")
+        self.assertEqual([f["path"] for f in listing["files"]], ["split_files/vae/qwen_vae.safetensors"])
+        self.assertEqual(listing["files"][0]["sha256"], SHA_VAE)
+
+    async def test_single_file_missing_from_repo(self):
+        await self.serve()
+        info, only = rs.parse_hf_file_url("https://huggingface.co/a/b/blob/main/nope.safetensors")
+        async with aiohttp.ClientSession() as session:
+            with self.assertRaises(rs.DownloadError) as ctx:
+                await rs.list_hf_repo(session, info, only)
+        self.assertEqual(ctx.exception.code, "hf_file_not_found")
+
+    async def test_hf_errors_have_codes(self):
+        await self.serve(status=403)
+        async with aiohttp.ClientSession() as session:
+            with self.assertRaises(rs.DownloadError) as ctx:
+                await rs.list_hf_repo(session, rs.parse_hf_repo_url("https://huggingface.co/a/b"))
+        self.assertEqual((ctx.exception.code, ctx.exception.params), ("hf_denied", {"status": 403}))
+
+    async def test_post_job_reports_codes(self):
+        async def post(body):
+            async def read_json():
+                return body
+            resp = await rs.post_job(types.SimpleNamespace(json=read_json))
+            return resp.status, json.loads(resp.text)
+
+        status, data = await post({"url": "https://huggingface.co/a/b/blob/main/x.safetensors"})
+        self.assertEqual((status, data["code"]), (400, "need_folder"))
+        status, data = await post({"url": "https://h/x.exe", "folder": "vae", "filename": "x.exe"})
+        self.assertEqual((status, data["code"], data["params"]), (400, "bad_extension", {"ext": ".exe"}))
+        status, data = await post({"url": "ftp://h/x.safetensors"})
+        self.assertEqual(data["code"], "bad_url")
 
     async def test_diffusers_repo_is_detected(self):
         async def tree(_request):
