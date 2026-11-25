@@ -4,3 +4,4 @@ __pycache__/
 *.rafaga.part
 *.rafaga.json
 .DS_Store
+CLAUDE.local.md

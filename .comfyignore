@@ -2,3 +2,5 @@
 .github/
 tests/
 .gitignore
+CLAUDE.md
+CLAUDE.local.md
